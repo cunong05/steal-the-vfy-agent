@@ -1,8 +1,11 @@
 // Steal the VFY agent — server
-// Node.js, no framework, plain http. See README.md for the protocol.
+// Node.js, no framework, plain http. Protocol: official shapes from
+// https://agentgames.zkverify.io/build (verified 16 Nov 2026).
 //
 //   GET  /health  -> readiness (hmac configured? proof artifacts present?)
-//   POST /steal   -> signed turn envelope in, signed action+proof out
+//   GET  /agent   -> preflight responder { ok: true, protocolVersion: "v1" }
+//   POST /agent   -> signed turn envelope in, signed action+proof out
+//   POST /steal   -> alias of /agent (kept for compatibility)
 //
 // Env (see .env.example):
 //   PORT, AGENT_GAMES_HMAC_SECRET, STEAL_STRATEGY_* , CIRCUIT_VERSION
@@ -12,9 +15,18 @@ const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { verifyHmac, signBody, timingSafeEqualHex } = require("./steal/protocol");
+const {
+  verifyHmac,
+  signBody,
+  timingSafeEqualHex,
+  newIdempotencyKey,
+} = require("./steal/protocol");
 const { decide, createTracker, paramsFromEnv } = require("./steal/strategy");
-const { generatePolicyProof, CIRCUIT_VERSION } = require("./steal/proof");
+const {
+  generatePolicyProof,
+  publicInputsHash,
+  CIRCUIT_VERSION,
+} = require("./steal/proof");
 
 const PORT = Number(process.env.PORT || 8080);
 const HMAC_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || "";
@@ -24,7 +36,7 @@ const CIRCUITS_DIR = path.join(__dirname, "circuits");
 const WASM_PATH = path.join(CIRCUITS_DIR, "vfy-policy.wasm");
 const ZKEY_PATH = path.join(CIRCUITS_DIR, "vfy-policy_final.zkey");
 
-// Idempotency: matchId + turn -> cached response body (string).
+// Idempotency: matchId + turn -> cached response body (string) + key.
 // The platform may retry after a network failure; a retry of the same
 // turn is NOT a new turn, and the idempotency key must never be reused
 // for a different turn.
@@ -66,6 +78,16 @@ function sendJson(res, status, obj, sign = false) {
   res.end(body);
 }
 
+function sendSigned(res, status, body) {
+  res.writeHead(status, {
+    "content-type": "application/json",
+    ...(hmacConfigured()
+      ? { "x-agent-games-signature": signBody(body, HMAC_SECRET, HMAC_FORMAT) }
+      : {}),
+  });
+  res.end(body);
+}
+
 function healthPayload() {
   return {
     status: "ok",
@@ -79,19 +101,42 @@ function healthPayload() {
   };
 }
 
-// Minimal envelope normalization. The exact JSON keys of the turn envelope
-// are confirmed from the first practice envelope (see steal/protocol.js);
-// unknown extra fields are preserved and passed to the strategy as-is.
+// Official turn envelope (agentgames.zkverify.io/build):
+//   { protocolVersion, eventId, mode, matchId, turn, issuedAt,
+//     deadlineAt, state: { selfBalance, opponentBalance,
+//     selfFortifiedUntilTurn, opponentFortifiedUntilTurn },
+//     strategyCommitment: { hash }, resolverVersion, nonce }
+// Balances arrive as decimal STRINGS. Old key names are kept as a
+// fallback only — the official names take precedence.
 function normalizeEnvelope(raw) {
   const e = raw || {};
+  const state = e.state || {};
   return {
+    protocolVersion: e.protocolVersion || null,
+    eventId: e.eventId || null,
+    mode: e.mode || "competition",
     matchId: e.matchId ?? e.match_id ?? e.matchID ?? null,
     turn: Number(e.turn ?? e.turnNumber ?? e.turn_number ?? 0),
-    myBalance: Number(e.myBalance ?? e.my_balance ?? e.balance ?? 100),
-    oppBalance: Number(e.oppBalance ?? e.opp_balance ?? e.opponentBalance ?? 100),
-    // Optional fields the envelope may carry (fortify state, deadline, ...).
-    commitmentHash: e.commitmentHash ?? e.commitment_hash ?? e.commitment ?? null,
-    deadline: e.deadline ?? null,
+    issuedAt: e.issuedAt || null,
+    deadlineAt: e.deadlineAt ?? e.deadline ?? null,
+    myBalance: Number(
+      state.selfBalance ?? state.myBalance ?? e.myBalance ?? e.selfBalance ?? 100
+    ),
+    oppBalance: Number(
+      state.opponentBalance ?? state.oppBalance ?? e.oppBalance ?? e.opponentBalance ?? 100
+    ),
+    myFortifiedUntilTurn:
+      state.selfFortifiedUntilTurn ?? state.myFortifiedUntilTurn ?? null,
+    oppFortifiedUntilTurn:
+      state.opponentFortifiedUntilTurn ?? state.oppFortifiedUntilTurn ?? null,
+    commitmentHash:
+      (e.strategyCommitment && e.strategyCommitment.hash) ||
+      e.commitmentHash ||
+      e.commitment_hash ||
+      e.commitment ||
+      null,
+    resolverVersion: e.resolverVersion || null,
+    nonce: e.nonce || null,
     raw: e,
   };
 }
@@ -102,7 +147,13 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, healthPayload());
     }
 
-    if (req.method === "POST" && (req.url === "/steal" || req.url === "/agent")) {
+    // Preflight responder (dashboard health check): signed
+    // { ok: true, protocolVersion: "v1" }.
+    if (req.method === "GET" && (req.url === "/agent" || req.url === "/agent/")) {
+      return sendJson(res, 200, { ok: true, protocolVersion: "v1", agent: "CUNONG-2", event: "steal_the_vfy" }, true);
+    }
+
+    if (req.method === "POST" && (req.url === "/steal" || req.url === "/agent" || req.url === "/agent/")) {
       const rawBody = await readBody(req);
 
       // 1. Verify the HMAC over the RAW body before parsing anything.
@@ -120,6 +171,11 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { error: "invalid json" });
       }
 
+      // Preflight POST (if the platform sends one): signed ok.
+      if (parsed && (parsed.mode === "preflight" || parsed.type === "preflight")) {
+        return sendJson(res, 200, { ok: true, protocolVersion: "v1" }, true);
+      }
+
       const env = normalizeEnvelope(parsed);
       if (!env.matchId || !env.turn) {
         return sendJson(res, 400, { error: "missing matchId/turn" });
@@ -127,65 +183,56 @@ const server = http.createServer(async (req, res) => {
 
       const key = `${env.matchId}:${env.turn}`;
       if (seenTurns.has(key)) {
-        // Retry of the same turn: return the exact cached response.
-        const cached = seenTurns.get(key);
-        res.writeHead(200, {
-          "content-type": "application/json",
-          ...(hmacConfigured()
-            ? { "x-agent-games-signature": signBody(cached, HMAC_SECRET, HMAC_FORMAT) }
-            : {}),
-        });
-        return res.end(cached);
+        // Retry of the same turn: return the exact cached response
+        // (same body, same idempotencyKey).
+        return sendSigned(res, 200, seenTurns.get(key));
       }
 
       // 2. Decide the action (per-match memory infers the opponent's
-      // last action from balance deltas).
+      // last action from balance deltas + the envelope's fortify fields).
       const tracker = trackerFor(env.matchId);
       tracker.observe(env);
       const decision = decide(env, paramsFromEnv(), tracker.snapshot());
       tracker.setMyAction(decision.action);
 
-      // 3. Prove it. On proof failure, answer HOLD with no proof rather
-      // than timing out: a missing proof scores the turn as HOLD, while a
-      // submitted-but-invalid proof costs -2 and a timeout costs -1 plus
-      // the opponent keeps extracting against forced HOLDs.
+      // 3. Prove it. On proof failure, answer HOLD with NO policyProof
+      // rather than timing out or sending a fake proof: the turn resolves
+      // as HOLD (per /build a missing proof is scored as invalid proof,
+      // -2 — the proof pipeline is the critical path before scored
+      // rounds; see steal/proof.js).
       let action = decision.action;
-      let proof = null;
+      let policyProof = null;
       try {
-        proof = await generatePolicyProof(env, decision);
+        const proof = await generatePolicyProof(env, decision);
+        policyProof = {
+          circuitVersion: proof.circuitVersion,
+          proof: proof.proof,
+          public_signals: proof.publicSignals,
+          ...(proof.publicInputsHash ? { publicInputsHash: proof.publicInputsHash } : {}),
+        };
       } catch (err) {
         console.error(`[turn ${key}] proof failed, falling back to HOLD:`, err.message);
         action = "HOLD";
-        proof = null;
+        policyProof = null;
       }
 
+      // Official response shape (agentgames.zkverify.io/build).
+      // amount ONLY for EXTRACT — never for HOLD/FORTIFY, even 0.
       const response = {
         matchId: env.matchId,
         turn: env.turn,
-        action,
-        ...(action === "EXTRACT" ? { amount: decision.amount } : {}),
-        ...(proof
-          ? {
-              proof: {
-                circuitVersion: CIRCUIT_VERSION,
-                proof: proof.proof,
-                publicSignals: proof.publicSignals,
-              },
-              ...(proof.publicInputsHash ? { publicInputsHash: proof.publicInputsHash } : {}),
-              ...(proof.proofReference ? { proofReference: proof.proofReference } : {}),
-            }
-          : {}),
+        action:
+          action === "EXTRACT"
+            ? { type: "EXTRACT", amount: decision.amount || 0 }
+            : { type: action },
+        ...(policyProof ? { policyProof } : {}),
+        agentTimestamp: new Date().toISOString(),
+        idempotencyKey: newIdempotencyKey(),
       };
 
       const body = JSON.stringify(response);
       seenTurns.set(key, body);
-      res.writeHead(200, {
-        "content-type": "application/json",
-        ...(hmacConfigured()
-          ? { "x-agent-games-signature": signBody(body, HMAC_SECRET, HMAC_FORMAT) }
-          : {}),
-      });
-      return res.end(body);
+      return sendSigned(res, 200, body);
     }
 
     return sendJson(res, 404, { error: "not found" });

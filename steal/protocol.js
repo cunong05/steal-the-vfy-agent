@@ -1,23 +1,29 @@
 // Turn-envelope / response protocol helpers for Steal the VFY.
-// Sources: https://agentgames.zkverify.io/build (section 06) and
-// https://agentgames.zkverify.io/events/steal-the-vfy
-//
-// What the platform sends each turn (signed turn envelope):
-//   - matchId, turn
-//   - game state: both balances, your frozen commitment hash, deadline
-//   - signed with HMAC; the agent verifies `x-agent-games-signature`
-//     over the RAW request body before parsing anything.
-// What the agent returns:
-//   - echo matchId + turn, declare the action, attach the policy proof
-//     (circuitVersion + Groth16 proof + publicSignals)
-//   - proofReference and publicInputsHash are optional on-chain audit
-//     pointers; a missing/mismatched required field is treated as HOLD.
-//   - the response itself is signed with x-agent-games-signature over the
-//     raw response body, using the same HMAC secret.
-//
-// OPEN ITEM: the exact JSON key names of the envelope are NOT published on
-// the public pages. Confirm them against the first practice envelope and
-// mirror them in server.js normalizeEnvelope(). Do not guess them here.
+// Sources (official, verified 16 Nov 2026):
+//   https://agentgames.zkverify.io/build — exact envelope + response
+//   shapes, action rules, publicInputsHash formula.
+// What the platform sends each turn (POST /agent, signed):
+//   { protocolVersion: "v1", eventId: "steal-the-vfy",
+//     mode: "competition"|"practice", matchId (UUID), turn (int),
+//     issuedAt, deadlineAt,
+//     state: { selfBalance: "95", opponentBalance: "105",
+//              selfFortifiedUntilTurn: null|int,
+//              opponentFortifiedUntilTurn: null|int },
+//     strategyCommitment: { hash: "0x..." }, resolverVersion: "v1",
+//     nonce }
+// What the agent returns (200, signed with x-agent-games-signature
+// over the raw response body):
+//   { matchId, turn,
+//     action: { type: "EXTRACT"|"FORTIFY"|"HOLD", amount?: N },
+//     policyProof?: { circuitVersion: "v1", proof: <raw snarkjs Groth16>,
+//                    public_signals: [...], publicInputsHash?: "0x..." },
+//     agentTimestamp, idempotencyKey }
+// Rules that cost turns if broken:
+//   - amount ONLY for EXTRACT (schema rejects it for HOLD/FORTIFY even 0).
+//   - proof + public_signals must sit INSIDE policyProof; omitting the
+//     proof scores the turn as invalid proof (-2, resolved as HOLD).
+//   - idempotencyKey must be unique per turn (never reused).
+//   - circuitVersion must match the registered strategy commitment ("v1").
 "use strict";
 
 const crypto = require("node:crypto");
@@ -49,4 +55,10 @@ function verifyHmac(rawBody, signature, secret, format = "hex") {
   return timingSafeEqualHex(signature, signBody(rawBody, secret, format));
 }
 
-module.exports = { hmacSha256Hex, signBody, timingSafeEqualHex, verifyHmac };
+// Unique idempotency key per turn (never reused across turns; retries of
+// the same turn return the cached response with the SAME key).
+function newIdempotencyKey() {
+  return crypto.randomUUID();
+}
+
+module.exports = { hmacSha256Hex, signBody, timingSafeEqualHex, verifyHmac, newIdempotencyKey };
