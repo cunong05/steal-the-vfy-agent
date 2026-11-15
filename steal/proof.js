@@ -27,23 +27,23 @@
 //   [out, commitment, matchId, turnNumber, selfBalance,
 //    opponentBalance, action, amount, circuitVersion]
 //   (matches the publicInputsHash field order on /build).
-// Commitment construction (verified by probe): the line-72 assert passes
-// iff commitment == Poseidon([strategyParams[0..7], salt]) (circomlibjs
-// poseidon, params first, salt last); any other commitment fails line 72.
-// OPEN — line-75 assert: blocks EVERY input combination tried so far
-// (all 3 actions; EXTRACT amounts 0-10; turns 1/3/20; balances incl.
-// 100/100 at turn 1; params [2,10,6,5,15,1,100,20] and all-1s;
-// salt 1/2; matchId UUID-int and 1; circuitVersion 0/1). It almost
-// certainly needs the TRUE strategyParams semantics — most likely defined
-// by the dashboard's "Set up strategy commitment" form. Do NOT go live
-// until a proof verifies locally (selfTest below).
-// ANOMALY (documented, not yet explained): strategyParams[4..7] are
-// accepted by the witness calculator (counted 8/8) yet never appear as
-// witness signals — only params[0..3] + salt materialize (witness
-// indices 10-14). The line-72 hash still depends on params[4..7]
-// (changing params[4] requires recomputing the commitment), so they
-// ARE read by the circuit somehow. Do not "fix" this by reordering;
-// it needs the .circom source to explain.
+// Commitment construction (VERIFIED 16 Nov 2026 —
+// ~/workspace/zkverify/steal-the-vfy/hidden_files/line75-probe-results.md):
+// commitment == Poseidon([strategyParams[0..7], salt]) (circomlibjs,
+// params first, salt last). The line-72 assert passes iff the envelope's
+// strategyCommitment.hash equals this value; the publicSignals[1]
+// (pubCommit) returned by fullProve equals it too. The dashboard's
+// "Update commitment" form registers this hash (replacing the default
+// vkHash); the platform then sends it back in every turn envelope.
+// LINE-75 BLOKER — SOLVED 16 Nov 2026 ~03:35 WIB: line 75 asserts
+// params[4] == 0 (lines 76-78: params[5..7] == 0; line 90: p0 > 0;
+// line 95: p0 <= 10; line 98: p3 < 2). The full circuit policy is:
+//   self < p1 -> FORTIFY; p3==1 or opp <= p2 -> HOLD; else EXTRACT p0.
+// decide() in steal/strategy.js implements exactly this — the proof
+// only verifies when the decision matches the circuit's prescription.
+// Old guesses (SHA256 over JSON; "p3<=p0 and p2<=p1") are WRONG and
+// were removed. Do NOT go live until selfTest() below passes with the
+// registered params + salt.
 "use strict";
 
 const path = require("node:path");
@@ -86,19 +86,21 @@ const INPUT_MAPPING = {
   strategyParams: () => strategyParams(),
 };
 
-// === STRATEGY COMMITMENT — UNVERIFIED, DO NOT TRUST YET ===
-// The platform freezes the HASH OF THE POLICY CIRCUIT (vkHash above),
-// NOT a hash of strategy parameters + salt. The old construction below
-// (SHA256 over JSON {params, salt}) was a guess made before /build was
-// read and is almost certainly NOT what the dashboard expects.
-// It is kept only so the value can be compared once the dashboard shows
-// the commitment it expects (tap "Set up strategy commitment" in the
-// dashboard); do NOT use it to register a commitment. The commitment
-// that matters is the circuit hash:
-//   vfy-policy vkHash =
-//   0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047
-// and circuitVersion "v1" must match the registered commitment.
+// === STRATEGY COMMITMENT — Poseidon([params, salt]) ===
+// Verified against the circuit (line-72 assert + publicSignals[1]).
+// Async because circomlibjs builds the Poseidon instance on first use;
+// the instance is cached across calls.
+let _poseidon = null;
+async function poseidonInstance() {
+  if (!_poseidon) {
+    const { buildPoseidon } = require("circomlibjs");
+    _poseidon = await buildPoseidon();
+  }
+  return _poseidon;
+}
+
 function strategyParams() {
+  const { validateCircuitParams } = require("./strategy");
   const raw = process.env.STEAL_STRATEGY_PARAMS || "";
   const nums = raw
     .split(",")
@@ -108,18 +110,21 @@ function strategyParams() {
   if (nums.length === 0 || nums.some((n) => !Number.isFinite(n))) {
     throw new Error("STEAL_STRATEGY_PARAMS missing: set comma-separated numbers in .env");
   }
-  return nums;
+  return validateCircuitParams(nums);
 }
 
-function commitmentHash() {
-  // UNVERIFIED — see header above. Kept for comparison only.
-  const crypto = require("node:crypto");
-  const salt = process.env.STEAL_STRATEGY_SALT || "";
-  if (!salt) throw new Error("STEAL_STRATEGY_SALT missing: set a random hex salt in .env");
+function saltBigInt() {
+  const s = String(process.env.STEAL_STRATEGY_SALT || "").trim();
+  if (!s) throw new Error("STEAL_STRATEGY_SALT missing: set a hex salt in .env");
+  return BigInt(s.startsWith("0x") ? s : `0x${s}`);
+}
+
+async function commitmentHash() {
+  const poseidon = await poseidonInstance();
   const params = strategyParams();
-  const h = crypto.createHash("sha256");
-  h.update(JSON.stringify({ params, salt }));
-  return `0x${h.digest("hex")}`;
+  const input = [...params.map(BigInt), saltBigInt()];
+  const out = poseidon(input);
+  return `0x${BigInt(poseidon.F.toString(out)).toString(16).padStart(64, "0")}`;
 }
 
 // publicInputsHash (official formula, /build): keccak256 of 8 fields,
@@ -188,6 +193,8 @@ async function selfTest() {
   console.log("circuitVersion:", CIRCUIT_VERSION);
   console.log("artifacts present:", fs.existsSync(WASM_PATH), fs.existsSync(ZKEY_PATH));
   console.log("INPUT_MAPPING filled:", !!INPUT_MAPPING);
+  const params = strategyParams();
+  console.log("strategyParams:", JSON.stringify(params));
   // publicInputsHash is testable without the circuit: recompute the
   // documented example values by hand and check determinism + format.
   const env = {
@@ -195,15 +202,13 @@ async function selfTest() {
     turn: 3,
     myBalance: 95,
     oppBalance: 105,
-    // Test-only override: the commitment MUST equal
-    // Poseidon([strategyParams, salt]) or the proof fails the line-72
-    // assert. Pass it via STEAL_SELFTEST_COMMITMENT (decimal or 0x hex);
-    // the hardcoded dummy below is NOT a valid commitment and only
-    // exercises the publicInputsHash part.
+    // The commitment MUST equal Poseidon([strategyParams, salt]) or the
+    // proof fails the line-72 assert. Computed from the live env unless
+    // STEAL_SELFTEST_COMMITMENT overrides it (test-only).
     commitmentHash:
-      process.env.STEAL_SELFTEST_COMMITMENT ||
-      "0x7d00000000000000000000000000000000000000000000000000000000000091",
+      process.env.STEAL_SELFTEST_COMMITMENT || (await commitmentHash()),
   };
+  console.log("commitmentHash:", env.commitmentHash);
   const h1 = publicInputsHash(env, "EXTRACT", 5);
   const h2 = publicInputsHash(env, "EXTRACT", 5);
   const h3 = publicInputsHash(env, "HOLD", 0);
@@ -215,14 +220,24 @@ async function selfTest() {
     h1 === h2 &&
     h1 !== h3;
   console.log("publicInputsHash deterministic + action-sensitive:", hashOk);
+  if (!hashOk) return false;
   if (!INPUT_MAPPING) {
     console.log("selfTest: fill INPUT_MAPPING first (see header).");
     return false;
   }
+  // The decision MUST be the circuit-prescribed action for this state,
+  // or the proof fails lines 140/149. decide() implements the policy.
+  const { decide } = require("./strategy");
+  const decision = decide(env, params);
+  console.log("decision for 95/105:", JSON.stringify(decision));
   const t0 = Date.now();
-  const out = await generatePolicyProof(env, { action: "EXTRACT", amount: 5 });
+  const out = await generatePolicyProof(env, decision);
   console.log(`selfTest: proof OK in ${Date.now() - t0}ms, publicSignals=${out.publicSignals.length}`);
-  return true;
+  // publicSignals[1] must equal the commitment we registered.
+  const pubCommit = BigInt(out.publicSignals[1]).toString(16).padStart(64, "0");
+  const commitOk = `0x${pubCommit}`.toLowerCase() === env.commitmentHash.toLowerCase();
+  console.log("publicSignals[1] == commitmentHash:", commitOk);
+  return commitOk;
 }
 
 module.exports = {

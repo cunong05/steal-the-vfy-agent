@@ -32,24 +32,29 @@
 // gain" (used only to decide whether extracting is worth it) is
 // max(0, min(cap, oppBalance) - (oppFortified ? 6 : 0)).
 //
-// Policy shape (game-theoretic, simulator-verified):
-//  1. EXTRACT dominates HOLD against an unfortified opponent: it is free
-//     and moves balance your way. HOLD only when extraction gains ~nothing
-//     (opponent's exposed balance ~ 0) or when you must not reveal that
-//     you will extract (there is no such signalling in simultaneous
-//     submission — so HOLD is almost never right).
-//  2. FORTIFY pays ONLY when the opponent is about to extract and the
-//     amount it shields exceeds its cost. Fortifying against an opponent
-//     who holds just burns the cost every turn (verified in the simulator:
-//     an unconditional "fortify when ahead" rule stalls the lead). So the
-//     policy fortifies only when the opponent extracted on the previous
-//     turn (inferred from balance deltas — see createTracker) or, on turn
-//     1-2 with no history yet, when ahead and the shield value is clearly
-//     positive.
-//  3. Late game: with few turns left, protect a lead (FORTIFY) or chase a
-//     deficit (EXTRACT); never HOLD away the last turns.
+// Policy shape — CIRCUIT POLICY (verified 16 Nov 2026, see
+// ~/workspace/zkverify/steal-the-vfy/hidden_files/line75-probe-results.md).
+// The vfy-policy circuit prescribes EXACTLY one action per
+// (selfBalance, opponentBalance, strategyParams); any other action fails
+// the line-140/149 asserts and the turn falls back to HOLD without proof
+// (-2). The prescribed policy, for params [p0..p7]:
+//   if selfBalance < p1:        FORTIFY 0
+//   elif p3 == 1:               HOLD 0        (passive mode: never EXTRACT)
+//   elif opponentBalance <= p2: HOLD 0
+//   else:                       EXTRACT p0
+// Validity (line 75-78, 90, 95, 98): p4=p5=p6=p7=0, 1 <= p0 <= 10,
+// p3 in {0,1}; p1, p2 any >= 0. The action does NOT depend on turn,
+// matchId, salt, or fortify fields — only (self, opp, params).
+// Recommended params (probe §1): [10,0,0,0,0,0,0,0] — maximally
+// aggressive: EXTRACT 10 unless the opponent has nothing (HOLD).
+// Alternative validated: [2,10,6,0,0,0,0,0] — EXTRACT 2, FORTIFY when
+// self < 10, HOLD when opp <= 6.
+// The old heuristic below (lead-based fortify, opponent inference) is
+// KEPT only as dead documentation in the tracker/resolver helpers;
+// decide() MUST follow the circuit policy above, or live proofs fail.
 //  4. Never send `amount` for HOLD or FORTIFY — the schema rejects the
-//     field even when it is 0. Only EXTRACT carries an amount.
+//     field even when it is 0. Only EXTRACT carries an amount, and it
+//     MUST equal p0 exactly (line 149), even when oppBalance < p0.
 //
 // `state` shape (see server.js normalizeEnvelope — official /build fields):
 //   { matchId, turn (1..20), myBalance, oppBalance,
@@ -169,45 +174,84 @@ function fortifyValue(state, p) {
   return blocked - p.FORTIFY_COST;
 }
 
-function decide(state, params = paramsFromEnv(), memory = null) {
-  const turn = state.turn || 1;
+// === Circuit policy (the ONLY policy decide() may use) ===
+
+// Parse + validate the 8 strategy params from env STEAL_STRATEGY_PARAMS
+// (comma-separated, e.g. "10,0,0,0,0,0,0,0"). Throws on anything the
+// circuit rejects (line 75-78: p4..p7 must be 0; line 90: p0 >= 1;
+// line 95: p0 <= 10; line 98: p3 in {0,1}).
+function validateCircuitParams(params) {
+  if (!Array.isArray(params) || params.length !== 8) {
+    throw new Error("strategyParams must be an array of 8 numbers");
+  }
+  if (params.some((n) => !Number.isInteger(n) || n < 0)) {
+    throw new Error("strategyParams must be non-negative integers");
+  }
+  const [p0, , , p3, p4, p5, p6, p7] = params;
+  if (p4 !== 0 || p5 !== 0 || p6 !== 0 || p7 !== 0) {
+    throw new Error("strategyParams[4..7] must be 0 (circuit lines 75-78)");
+  }
+  if (p0 < 1 || p0 > 10) {
+    throw new Error("strategyParams[0] must be 1..10 (circuit lines 90/95)");
+  }
+  if (p3 !== 0 && p3 !== 1) {
+    throw new Error("strategyParams[3] must be 0 or 1 (circuit line 98)");
+  }
+  return params;
+}
+
+function circuitParamsFromEnv(env = process.env) {
+  const raw = String(env.STEAL_STRATEGY_PARAMS || "");
+  const nums = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(Number);
+  if (nums.length === 0) {
+    throw new Error("STEAL_STRATEGY_PARAMS missing: set 8 comma-separated numbers in .env");
+  }
+  return validateCircuitParams(nums);
+}
+
+// Pure circuit policy: the action the circuit prescribes for this state.
+// params = validated 8-number array. Returns { action, amount?, reason }.
+// EXTRACT amount is ALWAYS p0 exactly (line 149) — never min(p0, opp).
+function circuitPolicyDecision(state, params) {
+  const [p0, p1, p2, p3] = validateCircuitParams(params);
   const my = state.myBalance ?? 100;
   const opp = state.oppBalance ?? 100;
-  const lead = my - opp;
-  const turnsLeft = 20 - turn;
-  const mem = memory || { oppExtractedLast: false, oppFortifiedLast: false };
-
-  const oppFortified = isFortified(state.oppFortifiedUntilTurn, turn);
-  // Effective gain from extracting now (shield already accounted for).
-  const gain = effectiveTake(params.EXTRACT_CAP, opp, oppFortified, params);
-  // Declared amount is the pre-shield take (see header).
-  const declaredAmount = Math.min(params.EXTRACT_CAP, Math.floor(Math.max(0, opp)));
-
-  const fv = fortifyValue({ ...state, myBalance: my }, params);
-  // Fortify only when the opponent is actually extracting (inferred from
-  // the previous turn's balance deltas). On turn 1 there is no history
-  // and the lead is 0, so fortify cannot trigger there anyway.
-  const oppExtracting = mem.oppExtractedLast;
-  const late = turnsLeft <= 20 - params.FORTIFY_LATE_TURN;
-
-  if ((late || lead >= params.FORTIFY_MIN_LEAD) && fv > 0 && lead > 0 && oppExtracting) {
-    return { action: "FORTIFY", reason: `lead ${lead}, opp extracting, shield value ${fv.toFixed(1)} > 0` };
+  if (my < p1) {
+    return { action: "FORTIFY", reason: `self ${my} < p1=${p1}` };
   }
-  if (gain >= params.EXTRACT_MIN_EXPOSED && declaredAmount > 0) {
-    return {
-      action: "EXTRACT",
-      amount: declaredAmount,
-      reason: `opponent exposes ${gain.toFixed(1)} effective (fortified=${oppFortified})`,
-    };
+  if (p3 === 1 || opp <= p2) {
+    return { action: "HOLD", reason: p3 === 1 ? "passive mode p3=1" : `opp ${opp} <= p2=${p2}` };
   }
-  if (fv > 0 && oppExtracting && lead > 0) {
-    return { action: "FORTIFY", reason: `nothing to extract, shield value ${fv.toFixed(1)} > 0` };
+  return { action: "EXTRACT", amount: p0, reason: `opp ${opp} > p2=${p2}, extract p0=${p0}` };
+}
+
+// Resolve the circuit params from whatever the caller passed:
+// an 8-number array, { strategyParams: [...] }, or anything else
+// (game-knob object, undefined) -> read STEAL_STRATEGY_PARAMS from env.
+function resolveCircuitParams(paramsArg, env = process.env) {
+  if (Array.isArray(paramsArg)) return validateCircuitParams(paramsArg);
+  if (paramsArg && Array.isArray(paramsArg.strategyParams)) {
+    return validateCircuitParams(paramsArg.strategyParams);
   }
-  return { action: "HOLD", reason: "nothing to extract, fortify loses money" };
+  return circuitParamsFromEnv(env);
+}
+
+function decide(state, paramsArg, memory = null) {
+  void memory; // the circuit policy needs no opponent inference
+  const params = resolveCircuitParams(paramsArg);
+  return circuitPolicyDecision(state, params);
 }
 
 module.exports = {
   decide,
+  circuitPolicyDecision,
+  circuitParamsFromEnv,
+  validateCircuitParams,
+  resolveCircuitParams,
   paramsFromEnv,
   DEFAULT_PARAMS,
   fortifyValue,

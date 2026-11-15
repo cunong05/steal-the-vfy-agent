@@ -21,7 +21,7 @@ const {
   timingSafeEqualHex,
   newIdempotencyKey,
 } = require("./steal/protocol");
-const { decide, createTracker, paramsFromEnv } = require("./steal/strategy");
+const { decide, createTracker, paramsFromEnv, circuitParamsFromEnv } = require("./steal/strategy");
 const {
   generatePolicyProof,
   publicInputsHash,
@@ -189,11 +189,12 @@ const server = http.createServer(async (req, res) => {
         return sendSigned(res, 200, seenTurns.get(key));
       }
 
-      // 2. Decide the action (per-match memory infers the opponent's
-      // last action from balance deltas + the envelope's fortify fields).
+      // 2. Decide the action with the CIRCUIT policy (strategy params
+      // from env). Any other action fails the circuit's line-140/149
+      // asserts and the turn falls back to HOLD without proof.
       const tracker = trackerFor(env.matchId);
       tracker.observe(env);
-      const decision = decide(env, paramsFromEnv(), tracker.snapshot());
+      const decision = decide(env, circuitParamsFromEnv(), tracker.snapshot());
       tracker.setMyAction(decision.action);
 
       // 3. Prove it. On proof failure, answer HOLD with NO policyProof

@@ -19,16 +19,19 @@
 // exactly like the real turn envelope does.
 //
 // Usage:
-//   node steal/simulator.js            -> plays the default policy against
-//                                          baselines across a parameter grid
-//                                          and prints win rates.
-//   node steal/simulator.js calibrate  -> same grid, plus a note on which
-//                                          knobs to adjust.
-//
-// The official numbers are FORTIFY_COST=2, EXTRACT_CAP=10,
-// FORTIFY_BLOCK=6. The grid varies each one around the official value
-// to check sensitivity in case practice turns show the numbers are
-// parameters that can change (see STATUS.md).
+//   node steal/simulator.js                  -> default policy [10,0,0,0]
+//                                              vs baselines, official
+//                                              numbers + sensitivity grid.
+//   node steal/simulator.js 2,10,6,0         -> same, with params
+//                                              [2,10,6,0,0,0,0,0].
+//   node steal/simulator.js compare          -> compares the candidate
+//                                              param sets [10,0,0,0],
+//                                              [2,10,6,0], [10,10,6,0]
+//                                              vs baselines at OFFICIAL
+//                                              numbers only (both seats).
+// The policy under test is ALWAYS the circuit policy from
+// steal/strategy.js decide() — the grid varies only the GAME numbers
+// (cost/cap/block), never the circuit params.
 "use strict";
 
 const {
@@ -38,6 +41,7 @@ const {
   isFortified,
   nextFortifiedUntilTurn,
   effectiveTake,
+  validateCircuitParams,
 } = require("./strategy");
 
 // Resolve one turn.
@@ -138,35 +142,69 @@ function grid() {
   return out;
 }
 
+function runVsBaselines(policy, p) {
+  const row = {};
+  for (const [name, base] of Object.entries(baselines)) {
+    let w = 0;
+    let d = 0;
+    let l = 0;
+    for (let seat = 0; seat < 2; seat++) {
+      const r =
+        seat === 0
+          ? playMatch(policy, base, p)
+          : playMatch(base, policy, p) * -1;
+      if (r === 1) w++;
+      else if (r === 0) d++;
+      else l++;
+    }
+    row[name] = `${w}W/${d}D/${l}L`;
+  }
+  return row;
+}
+
 function main() {
-  const mode = process.argv[2] || "evaluate";
+  const arg = process.argv[2] || "";
   const official = { ...DEFAULT_PARAMS };
+
+  if (arg === "compare") {
+    // Candidate circuit param sets (p0,p1,p2,p3; p4..p7 = 0).
+    const candidates = [
+      [10, 0, 0, 0, 0, 0, 0, 0],
+      [2, 10, 6, 0, 0, 0, 0, 0],
+      [10, 10, 6, 0, 0, 0, 0, 0],
+    ];
+    for (const cand of candidates) {
+      const policy = (s, pp, m) => decide(s, cand, m);
+      console.log(`params [${cand.slice(0, 4)}]`, JSON.stringify(runVsBaselines(policy, official)));
+    }
+    return;
+  }
+
+  // Circuit params from CLI ("2,10,6,0") or env, else the recommended
+  // [10,0,0,0,0,0,0,0].
+  let circuit;
+  if (arg && arg !== "calibrate") {
+    const nums = arg.split(",").map(Number);
+    while (nums.length < 8) nums.push(0);
+    circuit = validateCircuitParams(nums);
+  } else if (process.env.STEAL_STRATEGY_PARAMS) {
+    const nums = process.env.STEAL_STRATEGY_PARAMS.split(",").map(Number);
+    while (nums.length < 8) nums.push(0);
+    circuit = validateCircuitParams(nums);
+  } else {
+    circuit = [10, 0, 0, 0, 0, 0, 0, 0];
+  }
+  const policy = (s, pp, m) => decide(s, circuit, m);
+  console.log(`circuit params [${circuit.slice(0, 4)}]`);
   const points = [{ label: "OFFICIAL cost=2 cap=10 block=6", p: official }, ...grid().map((p) => ({
     label: `cost=${p.FORTIFY_COST} cap=${p.EXTRACT_CAP} block=${p.FORTIFY_BLOCK}`,
     p,
   }))];
   for (const { label, p } of points) {
-    const row = {};
-    for (const [name, base] of Object.entries(baselines)) {
-      let w = 0;
-      let d = 0;
-      let l = 0;
-      // Both seats: our policy as A and as B (symmetric check).
-      for (let seat = 0; seat < 2; seat++) {
-        const r =
-          seat === 0
-            ? playMatch((s, pp, m) => decide(s, pp, m), base, p)
-            : playMatch(base, (s, pp, m) => decide(s, pp, m), p) * -1;
-        if (r === 1) w++;
-        else if (r === 0) d++;
-        else l++;
-      }
-      row[name] = `${w}W/${d}D/${l}L`;
-    }
-    console.log(label, JSON.stringify(row));
+    console.log(label, JSON.stringify(runVsBaselines(policy, p)));
   }
-  if (mode === "calibrate") {
-    console.log("\n(calibration: adjust FORTIFY_MIN_LEAD / FORTIFY_LATE_TURN in strategy.js, re-run)");
+  if (arg === "calibrate") {
+    console.log("\n(calibration: circuit params are fixed by the circuit; compare candidates with `node steal/simulator.js compare`)");
   }
 }
 
