@@ -16,35 +16,34 @@
 // public_signals are the circuit's public signals as decimal strings in
 // output-then-public order (exactly what snarkjs returns).
 //
-// === OPEN ITEM — INPUT_MAPPING (read this before going live) ===
-// The circuit takes 17 inputs (9 public: 1 output + 8 public inputs,
-// confirmed by vfy-vk.json IC length 10). The exact input SIGNAL NAMES
-// are NOT published anywhere checked so far (16 Nov 2026):
-//   (a) GET /api/circuit-info — only vkHash + artifact URLs, no inputs.
-//   (b) /build page text — envelope/response shapes + the
-//       publicInputsHash formula, but NO circuit signal names.
-//   (c) strings on circuits/vfy-policy.wasm — only obfuscated Circom
-//       component names (Ark_148, AND_82, VfyPolicyProof_154); signal
-//       names are NOT embedded in the wasm (they live in the .sym file).
-//   (d) https://agentgames.zkverify.io/circuits/vfy-policy.sym — 404.
-// The 8 public inputs are KNOWN by value from the publicInputsHash
-// formula on /build (in order): strategyCommitment.hash, matchId (UUID
-// without dashes, as int), turn, selfBalance, opponentBalance,
-// actionCode (HOLD 0, FORTIFY 1, EXTRACT 2), amount (0 for HOLD /
-// FORTIFY), circuitVersion "v1" -> 1. So the public signals are almost
-// certainly [output, commitment, matchId, turn, selfBalance,
-// opponentBalance, actionCode, amount, 1] — but the circuit's input
-// signal NAMES (needed to build the witness for snarkjs fullProve) are
-// still missing, and a practice turn envelope does NOT carry them either.
-// NEXT STEP: obtain the .circom source or the .sym file for vfy-policy
-// from the platform (docs / dashboard / support) and fill INPUT_MAPPING
-// below; then run `node -e "require('./steal/proof').selfTest()"`.
-//
-// Until INPUT_MAPPING is filled, generatePolicyProof() throws a clear
-// error and server.js answers HOLD with no proof (safe fallback — the
-// turn resolves as HOLD; note /build says a turn with no proof is scored
-// as an invalid proof, -2, so the proof pipeline is the critical path
-// before any scored round).
+// === INPUT SIGNAL NAMES — RECOVERED 16 Nov 2026 (see
+// ~/workspace/zkverify/steal-the-vfy/hidden_files/signal-probe-results.md)
+// Method: wasm getInputSignalSize oracle (existence + array size) +
+// witness-calculator input counting. All 17 inputs found:
+//   commitment(1), matchId(1), turnNumber(1) [= turn], selfBalance(1),
+//   opponentBalance(1), action(1), amount(1), circuitVersion(1),
+//   salt(1), strategyParams(8)  — total 1*8 + 1 + 8 = 17.
+// Public-signal order confirmed by witness dump:
+//   [out, commitment, matchId, turnNumber, selfBalance,
+//    opponentBalance, action, amount, circuitVersion]
+//   (matches the publicInputsHash field order on /build).
+// Commitment construction (verified by probe): the line-72 assert passes
+// iff commitment == Poseidon([strategyParams[0..7], salt]) (circomlibjs
+// poseidon, params first, salt last); any other commitment fails line 72.
+// OPEN — line-75 assert: blocks EVERY input combination tried so far
+// (all 3 actions; EXTRACT amounts 0-10; turns 1/3/20; balances incl.
+// 100/100 at turn 1; params [2,10,6,5,15,1,100,20] and all-1s;
+// salt 1/2; matchId UUID-int and 1; circuitVersion 0/1). It almost
+// certainly needs the TRUE strategyParams semantics — most likely defined
+// by the dashboard's "Set up strategy commitment" form. Do NOT go live
+// until a proof verifies locally (selfTest below).
+// ANOMALY (documented, not yet explained): strategyParams[4..7] are
+// accepted by the witness calculator (counted 8/8) yet never appear as
+// witness signals — only params[0..3] + salt materialize (witness
+// indices 10-14). The line-72 hash still depends on params[4..7]
+// (changing params[4] requires recomputing the commitment), so they
+// ARE read by the circuit somehow. Do not "fix" this by reordering;
+// it needs the .circom source to explain.
 "use strict";
 
 const path = require("node:path");
@@ -64,15 +63,28 @@ const { keccak256 } = require("./keccak");
 // Action codes for publicInputsHash (official, /build).
 const ACTION_CODE = { HOLD: 0, FORTIFY: 1, EXTRACT: 2 };
 
-// TODO: map turn-envelope fields + strategy params to the circuit's input
-// signal names, e.g.:
-//   INPUT_MAPPING = {
-//     <signalName>: (env, decision) => ...,
-//     ...
-//   };
-// The key names must match the circuit's input signal names exactly.
-// See the OPEN ITEM header above for where the names must come from.
-const INPUT_MAPPING = null;
+// Circuit input signals -> turn-envelope fields + decision + env.
+// Key names MUST match the circuit's input signal names exactly
+// (recovered 16 Nov 2026 — see header). Values: BigInt for the large
+// hashes/ids (snarkjs handles BigInt), plain numbers for the small ones.
+const INPUT_MAPPING = {
+  // Public inputs.
+  commitment: (env) => BigInt(env.commitmentHash),
+  matchId: (env) => BigInt(`0x${String(env.matchId).replace(/-/g, "")}`),
+  turnNumber: (env) => env.turn,
+  selfBalance: (env) => env.myBalance,
+  opponentBalance: (env) => env.oppBalance,
+  action: (env, decision) => ACTION_CODE[decision.action],
+  amount: (env, decision) => (decision.action === "EXTRACT" ? decision.amount || 0 : 0),
+  circuitVersion: () => 1, // "v1" -> 1 (official /build formula)
+  // Private inputs.
+  salt: () => {
+    const s = String(process.env.STEAL_STRATEGY_SALT || "").trim();
+    if (!s) throw new Error("STEAL_STRATEGY_SALT missing: set a hex salt in .env");
+    return BigInt(s.startsWith("0x") ? s : `0x${s}`);
+  },
+  strategyParams: () => strategyParams(),
+};
 
 // === STRATEGY COMMITMENT — UNVERIFIED, DO NOT TRUST YET ===
 // The platform freezes the HASH OF THE POLICY CIRCUIT (vkHash above),
@@ -142,7 +154,7 @@ function publicInputsHash(env, action, amount) {
 async function generatePolicyProof(env, decision) {
   if (!INPUT_MAPPING) {
     throw new Error(
-      "INPUT_MAPPING not filled: the circuit input signal names are not published on /build, /api/circuit-info, or in the wasm — obtain the .circom source or .sym file (see steal/proof.js header)"
+      "INPUT_MAPPING not filled in steal/proof.js — cannot build a policy proof"
     );
   }
   if (!fs.existsSync(WASM_PATH) || !fs.existsSync(ZKEY_PATH)) {
@@ -183,7 +195,14 @@ async function selfTest() {
     turn: 3,
     myBalance: 95,
     oppBalance: 105,
-    commitmentHash: "0x7d00000000000000000000000000000000000000000000000000000000000091",
+    // Test-only override: the commitment MUST equal
+    // Poseidon([strategyParams, salt]) or the proof fails the line-72
+    // assert. Pass it via STEAL_SELFTEST_COMMITMENT (decimal or 0x hex);
+    // the hardcoded dummy below is NOT a valid commitment and only
+    // exercises the publicInputsHash part.
+    commitmentHash:
+      process.env.STEAL_SELFTEST_COMMITMENT ||
+      "0x7d00000000000000000000000000000000000000000000000000000000000091",
   };
   const h1 = publicInputsHash(env, "EXTRACT", 5);
   const h2 = publicInputsHash(env, "EXTRACT", 5);

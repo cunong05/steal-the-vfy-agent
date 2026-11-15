@@ -171,8 +171,9 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { error: "invalid json" });
       }
 
-      // Preflight POST (if the platform sends one): signed ok.
-      if (parsed && (parsed.mode === "preflight" || parsed.type === "preflight")) {
+      // Preflight POST (platform sends type "agent-games.preflight.v1"):
+      // signed { ok: true, protocolVersion: "v1" }.
+      if (parsed && (parsed.mode === "preflight" || parsed.type === "preflight" || parsed.type === "agent-games.preflight.v1")) {
         return sendJson(res, 200, { ok: true, protocolVersion: "v1" }, true);
       }
 
