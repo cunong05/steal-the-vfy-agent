@@ -42,6 +42,19 @@ const ZKEY_PATH = path.join(CIRCUITS_DIR, "vfy-policy_final.zkey");
 // for a different turn.
 const seenTurns = new Map();
 
+// Turn log: last 20 turns, exposed via /health so the watch can confirm
+// match/turn/action/proof WITHOUT Railway logs. Root cause found 16 Nov
+// ~19:53 WIB: before this change the server NEVER logged a successful
+// turn (only startup lines + proof-failure console.error), so Railway
+// logs could never show turn details — that was the "proof-failed tidak
+// terkonfirmasi" blind spot in Ronde 4, not a Railway CLI problem.
+// Retries do NOT append (same turn, cached response).
+const turnLog = [];
+function recordTurn(entry) {
+  turnLog.push({ ...entry, at: new Date().toISOString() });
+  if (turnLog.length > 20) turnLog.shift();
+}
+
 // Per-match strategy memory (opponent-action inference). One tracker per
 // matchId; it only observes a turn once (retries return the cached
 // response before the tracker is touched).
@@ -98,6 +111,10 @@ function healthPayload() {
     circuitVersion: CIRCUIT_VERSION,
     uptimeSec: Math.floor(process.uptime()),
     seenTurns: seenTurns.size,
+    // Last 20 turns (newest last): { matchId, turn, action, amount,
+    // proofOk, selfBalance, opponentBalance, at }. The Ronde 4/5 watch
+    // reads this instead of Railway logs.
+    lastTurns: turnLog.slice(-20),
   };
 }
 
@@ -236,6 +253,22 @@ const server = http.createServer(async (req, res) => {
 
       const body = JSON.stringify(response);
       seenTurns.set(key, body);
+      // Log + record every NEW turn (retries return the cached body
+      // above and are not logged again). No secrets here: matchId is a
+      // platform UUID, balances are game numbers.
+      const proofOk = !!policyProof;
+      recordTurn({
+        matchId: env.matchId,
+        turn: env.turn,
+        action,
+        amount: action === "EXTRACT" ? (decision.amount || 0) : null,
+        proofOk,
+        selfBalance: env.myBalance,
+        opponentBalance: env.oppBalance,
+      });
+      console.log(
+        `[turn ${key}] ${action}${action === "EXTRACT" ? " " + (decision.amount || 0) : ""} proof=${proofOk ? "ok" : "MISSING"} self=${env.myBalance} opp=${env.oppBalance}`
+      );
       return sendSigned(res, 200, body);
     }
 

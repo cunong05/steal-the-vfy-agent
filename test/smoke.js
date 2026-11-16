@@ -103,6 +103,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     assert.strictEqual(turn1.headers["x-agent-games-signature"], hmac(turn1.body), "response signature valid");
     console.log("POST /agent turn 3 OK (HOLD fallback, official shape):", JSON.stringify({ action: t1.action, idempotencyKey: t1.idempotencyKey }));
 
+    // 3b. /health exposes the turn in lastTurns (logging fix, 16 Nov).
+    const health2 = await req("GET", "/health");
+    assert.strictEqual(health2.status, 200, "GET /health 200 after turn");
+    const h2 = JSON.parse(health2.body);
+    assert.ok(Array.isArray(h2.lastTurns), "health: lastTurns is an array");
+    assert.strictEqual(h2.lastTurns.length, 1, "health: 1 turn recorded");
+    assert.strictEqual(h2.lastTurns[0].turn, 3, "lastTurns[0].turn is 3");
+    assert.strictEqual(h2.lastTurns[0].action, "HOLD", "lastTurns[0].action is HOLD");
+    assert.strictEqual(h2.lastTurns[0].proofOk, false, "lastTurns[0].proofOk is false (fallback)");
+    assert.strictEqual(h2.lastTurns[0].matchId, envelope.matchId, "lastTurns[0].matchId matches");
+    console.log("health lastTurns OK:", JSON.stringify(h2.lastTurns[0]));
+
     // 4. Retry of the same turn returns the identical body + key.
     const retry = await req("POST", "/agent", envelope);
     assert.strictEqual(retry.status, 200);
