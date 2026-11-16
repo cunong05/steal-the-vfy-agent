@@ -165,6 +165,16 @@ async function generatePolicyProof(env, decision) {
   if (!fs.existsSync(WASM_PATH) || !fs.existsSync(ZKEY_PATH)) {
     throw new Error("circuit artifacts missing in circuits/");
   }
+  // Practice envelopes may omit strategyCommitment.hash entirely (the
+  // platform's practice dispatcher does not always echo the registered
+  // commitment). The circuit input `commitment` is Poseidon(params,
+  // salt), which we compute locally — it MUST equal the registered hash,
+  // so filling it in here is safe. Without this, BigInt(null) throws
+  // "Cannot convert null to a BigInt" and the turn falls back to HOLD
+  // with no policyProof (platform schema fail).
+  if (!env.commitmentHash) {
+    env.commitmentHash = await commitmentHash();
+  }
   const snarkjs = require("snarkjs");
   const input = {};
   for (const [signal, fn] of Object.entries(INPUT_MAPPING)) {

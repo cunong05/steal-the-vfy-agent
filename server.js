@@ -130,11 +130,13 @@ function normalizeEnvelope(raw) {
     oppFortifiedUntilTurn:
       state.opponentFortifiedUntilTurn ?? state.oppFortifiedUntilTurn ?? null,
     commitmentHash:
-      (e.strategyCommitment && e.strategyCommitment.hash) ||
+      (e.strategyCommitment &&
+        (typeof e.strategyCommitment === "string"
+          ? e.strategyCommitment
+          : e.strategyCommitment.hash)) ||
       e.commitmentHash ||
       e.commitment_hash ||
-      e.commitment ||
-      null,
+      (typeof e.commitment === "string" ? e.commitment : null),
     resolverVersion: e.resolverVersion || null,
     nonce: e.nonce || null,
     raw: e,
