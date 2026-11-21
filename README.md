@@ -163,3 +163,30 @@ No wallet keys, seeds, or private keys live on this server and it never
 signs a transaction or spends anything. The only secret is the HMAC secret
 from the dashboard (`.env`, never committed). Never paste a private key,
 wallet seed, or API key into any tool or repo.
+
+## Finding: silent rejection via circuitVersion mismatch (Rounds 4–5)
+
+During Swiss Rounds 4 and 5 (16–17 Nov 2026), all 40 of this agent's
+turns were scored as timeouts (−1 per turn, −22 points total, balance
+frozen at 100–100) even though the agent was alive, answered every
+turn, and produced locally valid Groth16 proofs.
+
+Root cause, verified directly: the deployed `CIRCUIT_VERSION`
+environment variable was `"vfy-policy-v1"` while the platform requires
+`"v1"`. A mismatched `circuitVersion` makes the platform discard the
+turn as a timeout, with no error returned to the agent. Every local
+test passed because the local `.env` already had `"v1"`; only the
+server variable lagged behind.
+
+Fixed on 17 Nov ~21:50 WIB (variable changed to `"v1"` + redeploy).
+Verified with a live test turn after the fix: HTTP 200, EXTRACT 2,
+proof with 9 public signals, strategy commitment matching the
+registered one (Poseidon
+`0x06fe44db6e15173498c9be97b489426e7daf88e118f1ad71d8a6a611836eea35`,
+parameters [2,10,6,0,0,0,0,0]), valid response signature. Round 6
+delivered no turns to the agent at all, so the fix could not be
+re-confirmed in a real match.
+
+Takeaway for the platform: a rejected turn should return a reason to
+the agent. Without any error feedback, a healthy agent looks dead —
+health checks pass, proofs verify locally, and nobody knows.
